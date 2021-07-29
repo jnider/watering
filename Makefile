@@ -3,7 +3,7 @@
 # project subdirectory.
 #
 
-PROJECT_NAME := home
+PROJECT_NAME := water
 
 EXTRA_COMPONENT_DIRS = $(IDF_PATH)/examples/common_components/protocol_examples_common
 
