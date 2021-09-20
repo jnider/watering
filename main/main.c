@@ -22,12 +22,19 @@
 #include <esp_http_server.h>
 
 #define VER_MAJOR 1
-#define VER_MINOR 6
+#define VER_MINOR 10
 #define MAX_RESPONSE 1024
 #define WIFI_CONNECT_TIMEOUT (1000000 * 5)
-#define MAX_EVENTS 5
-#define MAX_URI_HANDLERS 15
+#define MAX_EVENTS 5					// number of scheduled watering events
+#define MAX_URI_HANDLERS 10		// registered URIs
+#define MAX_ACTIONS 10				// actions take from PUT commands
 #define OTA_BUF_SIZE 256
+#define PAGE_AUTO_REFRESH "15"
+#define MAX_HOSTNAME 32
+#define MAX_TIMEZONE 8
+#define MAX_SSID 32
+#define MAX_PW	64
+#define MAX_UPGRADE_URL 64
 
 #ifndef PIN2STR
 #define PIN2STR(a) (a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5], (a)[6], (a)[7]
@@ -40,35 +47,26 @@
 // on the Wemos D1mini board, this is pin D1
 #define WATER_PIN GPIO_NUM_5
 
-enum action_types
-{
-	ACTION_WATER_ON,
-	ACTION_WATER_OFF,
-	ACTION_ADD_EVENT,
-	ACTION_DEL_EVENT,
-	ACTION_SET_HOSTNAME,
-	ACTION_SET_NTP_HOST,
-	ACTION_SET_TIME,
-	ACTION_UPDATE_FW,
-	MAX_ACTIONS
-};
 
 // forward definitions of handlers for uris
 esp_err_t handler_index(httpd_req_t *req);
-esp_err_t handler_add_event(httpd_req_t *req);
-esp_err_t handler_del_event(httpd_req_t *req);
-esp_err_t handler_set_wifi(httpd_req_t *req);
-esp_err_t handler_set_ntp(httpd_req_t *req);
-esp_err_t handler_set_hostname(httpd_req_t *req);
-esp_err_t handler_set_time(httpd_req_t *req);
 esp_err_t form_hostname(httpd_req_t *req);
 esp_err_t form_add_event(httpd_req_t *req);
+esp_err_t form_set_time(httpd_req_t *req);
+esp_err_t form_set_ntp(httpd_req_t *req);
+esp_err_t form_set_wifi(httpd_req_t *req);
+esp_err_t form_set_upgrade(httpd_req_t *req);
+esp_err_t favicon(httpd_req_t *req);
 esp_err_t action_handler_water_on(const char *query);
 esp_err_t action_handler_water_off(const char *query);
 esp_err_t action_handler_add_event(const char *query);
 esp_err_t action_handler_del_event(const char *query);
 esp_err_t action_handler_set_hostname(const char *query);
 esp_err_t action_handler_update_fw(const char *query);
+esp_err_t action_handler_set_ntp(const char *query);
+esp_err_t action_handler_set_time(const char *query);
+esp_err_t action_handler_set_wifi(const char *query);
+esp_err_t action_handler_set_upgrade_url(const char *query);
 
 // There are 3 kinds of events:
 // skip > 0: every 'skip' seconds
@@ -111,8 +109,13 @@ static const char *day_str[] =
 	"Saturday"
 };
 
+extern const uint8_t favicon_png_start[] asm("_binary_favicon_png_start");
+extern const uint8_t favicon_png_end[] asm("_binary_favicon_png_end");
+
 static char ntp_server[64] = "pool.ntp.org";
-static char hostname[32] = "default";
+static char upgrade_url[64] = "http://192.168.20.30/water.bin";
+static char hostname[MAX_HOSTNAME] = "default";
+static char timezone[MAX_TIMEZONE] = "";
 static const char *TAG="APP";
 static const char nvs_namespace[] = "ns_wifi";
 static esp_wps_config_t wps_config = WPS_CONFIG_INIT_DEFAULT(WPS_TYPE_PBC);
@@ -148,13 +151,29 @@ static struct action actions[MAX_ACTIONS] =
 		.handler = action_handler_del_event
 	},
 	{
-		.name = "sethostname",
+		.name = "update_fw",
+		.handler = action_handler_update_fw
+	},
+	{
+		.name = "set_hostname",
 		.handler = action_handler_set_hostname
 	},
 	{
-		.name = "update_fw",
-		.handler = action_handler_update_fw
-	}
+		.name = "set_ntp",
+		.handler = action_handler_set_ntp
+	},
+	{
+		.name = "set_time",
+		.handler = action_handler_set_time
+	},
+	{
+		.name = "set_wifi",
+		.handler = action_handler_set_wifi
+	},
+	{
+		.name = "set_upgrade",
+		.handler = action_handler_set_upgrade_url
+	},
 };
 
 httpd_uri_t uris[] = {
@@ -171,9 +190,15 @@ httpd_uri_t uris[] = {
     .user_ctx  = ""
 },
 {
-    .uri       = "/host.html",
+    .uri       = "/hostname",
     .method    = HTTP_GET,
     .handler   = form_hostname,
+    .user_ctx  = ""
+},
+{
+    .uri       = "/time",
+    .method    = HTTP_GET,
+    .handler   = form_set_time,
     .user_ctx  = ""
 },
 {
@@ -183,27 +208,27 @@ httpd_uri_t uris[] = {
     .user_ctx  = ""
 },
 {
-    .uri       = "/config/set_wifi",
-    .method    = HTTP_POST,
-    .handler   = handler_set_wifi,
+    .uri       = "/ntp",
+    .method    = HTTP_GET,
+    .handler   = form_set_ntp,
     .user_ctx  = ""
 },
 {
-    .uri       = "/config/set_ntp",
-    .method    = HTTP_POST,
-    .handler   = handler_set_ntp,
+    .uri       = "/wifi",
+    .method    = HTTP_GET,
+    .handler   = form_set_wifi,
     .user_ctx  = ""
 },
 {
-    .uri       = "/config/set_hostname",
-    .method    = HTTP_POST,
-    .handler   = handler_set_hostname,
+    .uri       = "/upgrade",
+    .method    = HTTP_GET,
+    .handler   = form_set_upgrade,
     .user_ctx  = ""
 },
 {
-    .uri       = "/config/set_time",
-    .method    = HTTP_POST,
-    .handler   = handler_set_time,
+    .uri       = "/favicon.ico",
+    .method    = HTTP_GET,
+    .handler   = favicon,
     .user_ctx  = ""
 },
 };
@@ -274,6 +299,34 @@ void blink_start(uint64_t rate)
 void blink_stop(void)
 {
 	esp_timer_stop(blink_timer);
+}
+
+int set_hostname(const char *name)
+{
+	if (strlen(name) > MAX_HOSTNAME-1)
+	{
+		ESP_LOGE(TAG, "Hostname too long");
+		return -1;
+	}
+
+	strncpy(hostname, name, MAX_HOSTNAME);
+
+	// the host name must be set for mDNS and LWIP
+	mdns_hostname_set(hostname);
+	return 0;
+}
+
+void set_timezone(const char *tz)
+{
+	if (strlen(tz) > 7)
+	{
+		ESP_LOGE(TAG, "Timezone too long");
+		return;
+	}
+
+	strncpy(timezone, tz, 8);
+	setenv("TZ", timezone, 1);
+	tzset();
 }
 
 static void turn_water_on(void)
@@ -382,15 +435,12 @@ esp_err_t action_handler_add_event(const char *query)
 
 	memset(&event, 0, sizeof(water_event));
 
-	ESP_LOGI(TAG, "Adding event\n");
 	if (httpd_query_key_value(query, "time", value, 8) == ESP_OK)
 	{
-		char time[64];
+		char time[8];
 		urldecode2(time, value);
-		ESP_LOGI(TAG, "Time: %s\n", time);
 		event.hour = atoi(time);
 		event.minute = atoi(time+3);
-		ESP_LOGI(TAG, "Time: %u:%u\n", event.hour, event.minute);
 	}
 
 	if (httpd_query_key_value(query, "skip", value, 4) == ESP_OK)
@@ -410,6 +460,10 @@ esp_err_t action_handler_add_event(const char *query)
 		event.days |= 1 << 5;
 	if (httpd_query_key_value(query, "d6", value, 3) == ESP_OK && strcmp(value, "on") == 0)
 		event.days |= 1 << 6;
+
+	// special case - every day
+	if (event.days == 0x7F)
+		event.days = 0;
 
 	if (httpd_query_key_value(query, "duration", value, 5) == ESP_OK)
 		event.duration = atoi(value);
@@ -439,6 +493,154 @@ esp_err_t action_handler_del_event(const char *query)
 
 esp_err_t action_handler_set_hostname(const char *query)
 {
+	char value[MAX_HOSTNAME];
+	nvs_handle nvs;
+	esp_err_t err;
+
+	ESP_LOGI(TAG, "Set hostname");
+
+	err = httpd_query_key_value(query, "host", value, MAX_HOSTNAME);
+	if ((err == ESP_OK) && (nvs_open(nvs_namespace, NVS_READWRITE, &nvs) == ESP_OK))
+	{
+		size_t length;
+		char old_value[MAX_HOSTNAME];
+
+		// check if the value has changed
+		length = MAX_HOSTNAME;
+		if (nvs_get_str(nvs, "host", old_value, &length) != ESP_OK || strcmp(old_value, value) != 0)
+		{
+			nvs_set_str(nvs, "host", value);
+			set_hostname(value);
+		}
+		nvs_close(nvs);
+	}
+	else if (err == ESP_ERR_HTTPD_RESULT_TRUNC)
+	{
+		ESP_LOGE(TAG, "name too long (max %u)", MAX_HOSTNAME-1);
+		return ESP_ERR_HTTPD_RESP_HDR;
+	}
+
+	return ESP_OK;
+}
+
+esp_err_t action_handler_set_ntp(const char *query)
+{
+	char value[64];
+	nvs_handle nvs;
+
+	ESP_LOGI(TAG, "Set NTP host");
+	if ((httpd_query_key_value(query, "server", value, 64) == ESP_OK)
+		&& (nvs_open(nvs_namespace, NVS_READWRITE, &nvs) == ESP_OK))
+	{
+		size_t length;
+		char old_value[64];
+
+		// check if the value has changed
+		length = 64;
+		if (nvs_get_str(nvs, "ntp0", old_value, &length) != ESP_OK || strcmp(old_value, value) != 0)
+		{
+			nvs_set_str(nvs, "ntp0", value);
+			strcpy(ntp_server, value);
+		}
+		nvs_close(nvs);
+	}
+
+	return ESP_OK;
+}
+
+esp_err_t action_handler_set_time(const char *query)
+{
+	char value[64];
+	char time_buf[64];
+	struct tm timeinfo = { 0 };
+	struct timeval newtime;
+
+	if (httpd_query_key_value(query, "time", value, 20) == ESP_OK)
+	{
+		urldecode2(time_buf, value);
+		strptime(time_buf, "%Y-%m-%dT%R", &timeinfo);
+	}
+
+	newtime.tv_usec = 0;
+	newtime.tv_sec = mktime(&timeinfo);
+	settimeofday(&newtime, NULL);
+
+	return ESP_OK;
+}
+
+esp_err_t action_handler_set_wifi(const char *query)
+{
+	char value[64];
+	bool new_ssid = false;
+	bool new_pw = false;
+	wifi_config_t curr_config, new_config;
+
+	esp_wifi_get_config(ESP_IF_WIFI_STA, &curr_config);
+	memcpy(&new_config, &curr_config, sizeof(wifi_config_t));
+
+	// parse the parameters to find the new ssid name
+	if (httpd_query_key_value(query, "ssid", value, MAX_SSID) == ESP_OK)
+	{
+		urldecode2((char*)new_config.sta.ssid, value);
+		if (memcmp(new_config.sta.ssid, curr_config.sta.ssid, MAX_SSID) != 0)
+		{
+			new_ssid = true;
+			ESP_LOGI(TAG, "ssid: %s", (char*)new_config.sta.ssid);
+		}
+	}
+	if (httpd_query_key_value(query, "pw", value, MAX_PW) == ESP_OK)
+	{
+		urldecode2((char*)new_config.sta.password, value);
+		if (memcmp(new_config.sta.password, curr_config.sta.password, MAX_PW) != 0)
+		{
+			new_pw = true;
+			ESP_LOGI(TAG, "pw: %s", (char*)new_config.sta.ssid);
+		}
+	}
+
+	if (new_ssid || new_pw)
+	{
+		ESP_LOGI(TAG, "Connecting to AP: %s with password %s", new_config.sta.ssid, new_config.sta.password);
+		esp_wifi_set_config(ESP_IF_WIFI_STA, &new_config);
+		esp_wifi_connect();
+
+		// If we disconnect, it should reconnect automatically to the new SSID
+		// The wifi does connect, but we don't get an event (WIFI_EVENT_STA_CONNECT) so everything breaks
+		// rebooting is a work-around
+		//esp_timer_start_once(reboot_timer, 100000);
+	}
+	return ESP_OK;
+}
+
+esp_err_t action_handler_set_upgrade_url(const char *query)
+{
+	// add a few extra bytes to account for url encoding
+	char value[MAX_UPGRADE_URL+16];
+	nvs_handle nvs;
+
+	ESP_LOGI(TAG, "Set Upgrade URL");
+	if ((httpd_query_key_value(query, "url", value, MAX_UPGRADE_URL+16) == ESP_OK)
+		&& (nvs_open(nvs_namespace, NVS_READWRITE, &nvs) == ESP_OK))
+	{
+		size_t length;
+		char new_value[MAX_UPGRADE_URL];
+		char old_value[MAX_UPGRADE_URL];
+
+		// decode and check final length
+		urldecode2(new_value, value);
+		if (strlen(new_value) >= MAX_UPGRADE_URL)
+			return ESP_FAIL;
+
+		// check if the value has changed
+		length = MAX_UPGRADE_URL;
+		if (nvs_get_str(nvs, "upgrade", old_value, &length) != ESP_OK || strcmp(old_value, new_value) != 0)
+		{
+			nvs_set_str(nvs, "upgrade", new_value);
+			strcpy(upgrade_url, new_value);
+		}
+		nvs_close(nvs);
+	}
+
 	return ESP_OK;
 }
 
@@ -457,7 +659,7 @@ esp_err_t action_handler_update_fw(const char *query)
 	esp_http_client_handle_t client;
 	esp_http_client_config_t config =
 	{
-		.url = "http://192.168.20.30/water.bin",
+		.url = upgrade_url,
 		.event_handler = http_client_event_handler,
 	};
 
@@ -570,6 +772,17 @@ void reboot_callback(void *arg)
 }
 
 /*
+	Set time from NTP server
+*/
+static void obtain_time(void)
+{
+	ESP_LOGI(TAG, "Syncing NTP time from %s", ntp_server);
+	sntp_setoperatingmode(SNTP_OPMODE_POLL);
+	sntp_setservername(0, ntp_server);
+	sntp_init();
+}
+
+/*
 	Call this periodically to perform various tasks
 	(turn on the water, update the date/time, etc.)
 */
@@ -577,13 +790,22 @@ void scheduler(void *arg)
 {
 	time_t now = 0;
 	struct tm timeinfo = { 0 };
-	char line[100];
 	uint8_t evt;
 
 	time(&now);
 	localtime_r(&now, &timeinfo);
-	strftime(line, sizeof(line), "%c", &timeinfo);
-	//ESP_LOGI(TAG, "Scheduler @ %s", line);
+
+	// set the state of the Internet connection
+	if (sntp_getreachability(0) == 0 && state.internet == true)
+	{
+		ESP_LOGI(TAG, "Internet is down");
+		state.internet = false;
+	}
+	else if (sntp_getreachability(0) != 0 && state.internet != true)
+	{
+		ESP_LOGI(TAG, "Internet is up");
+		state.internet = true;
+	}
 
 	// iterate through all events
 	for (evt = 0; evt < MAX_EVENTS; evt++)
@@ -639,37 +861,32 @@ esp_err_t handler_help(httpd_req_t *req)
 	strcat(resp_str, "<tr><td>water_off<td><td>Turn water off now<td>http://192.168.1.1/?action=water_off</tr>\n");
 	strcat(resp_str, "<tr><td>add_event<td>time=[hh:mm], d0..d6=[on|off], duration=[secs]<td>Schedule a new watering event<td>http://192.168.1.1/?action=add_event&time=14%0e30&d1=on&d3=on&duration=60</tr>\n");
 	strcat(resp_str, "<tr><td><td>time=[hh:mm], skip=[secs], duration=[secs]<td>Schedule a new watering event, repeating every N seconds<td>http://192.168.1.1/?action=add_event&time=14%0e30&skip=3600&duration=15</tr>\n");
-	strcat(resp_str, "<tr><td>del_event<td>index=<event><td>Delete an existing event<td>\n");
+	strcat(resp_str, "<tr><td>del_event<td>index=&lt;event&gt;<td>Delete an existing event<td></tr>\n");
+	snprintf(line, 100, "<tr><td>set_hostname<td>host=&lt;name&gt;<td>Set a new hostname (max %u chars)<td></tr>\n", MAX_HOSTNAME);
+	strcat(resp_str, line);
+	strcat(resp_str, "</table><br><br>\n");
 	strcat(resp_str, "<a href=\"/\">Return to main page</a>\n");
+	strcat(resp_str, "</body></html>");
 
-	strcat(resp_str, "<h1>Add Event</h1>\n<form action=\"/\" method=\"PUT\">\n");
-	strcat(resp_str, "<br><input type=\"hidden\" name=\"action\" value=\"add_event\">\n");
-	strcat(resp_str, "<table><tr><td>Turn on at<td><input type=\"time\" name=\"time\"></tr>\n");
-	//strcat(resp_str, "<tr><td>Every<td><input type=\"number\" name=\"skip\" width=5>seconds</tr>\n");
-	strcat(resp_str, "<tr><td>On these days<td><input type=\"checkbox\" name=\"d0\">Sunday</tr>\n");
-	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d1\">Monday</tr>\n");
-	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d2\">Tuesday</tr>\n");
-	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d3\">Wednesday</tr>\n");
-	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d4\">Thursday</tr>\n");
-	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d5\">Friday</tr>\n");
-	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d6\">Saturday</tr>\n");
-	strcat(resp_str, "<tr><td>For<td><input type=\"number\" name=\"duration\" maxlength=4 max=3600> seconds</tr></table>\n");
 	return httpd_resp_send(req, resp_str, strlen(resp_str));
 }
 
+/*
+	The main HTML page
+*/
 esp_err_t handler_index(httpd_req_t *req)
 {
 	time_t now = 0;
 	struct tm timeinfo = { 0 };
 	wifi_config_t wifi_config;
-	char line[100];
+	char line[110];
 	char resp_str[MAX_RESPONSE];
 	char query[256];
 	uint8_t num_events = 0;
 	uint8_t evt;
 	uint8_t mac[7];
 	wifi_ap_record_t ap_info;
-	esp_err_t err;
+	esp_err_t err = ESP_OK;
 	bool command = false;
 	uint8_t action_idx;
 
@@ -683,6 +900,7 @@ esp_err_t handler_index(httpd_req_t *req)
 			{
 				if (strcmp(line, actions[action_idx].name) == 0)
 				{
+					ESP_LOGI(TAG, "action: %s", actions[action_idx].name);
 					err = actions[action_idx].handler(query);
 					command = true;
 					break;
@@ -707,11 +925,11 @@ esp_err_t handler_index(httpd_req_t *req)
 	strftime(line, sizeof(line), "%c", &timeinfo);
 
 	resp_str[0] = 0;
-	strcat(resp_str, "<html><title>Watering System</title>\n<body>\n");
+	strcat(resp_str, "<html><head><meta http-equiv=\"refresh\" content=\"" PAGE_AUTO_REFRESH ";url=/\"><title>Watering System</title></head>\n<body>\n");
 	snprintf(line, 100, "<h1>Joel's Watering System v%u.%u</h1>\n", VER_MAJOR, VER_MINOR);
 	strcat(resp_str, line);
 	strcat(resp_str, "<h2>Status</h2><table><tr><td>Time<td>\n");
-	strftime(line, sizeof(line), "%c</tr>", &timeinfo);
+	strftime(line, sizeof(line), "%c <a href=/time>[*]</a></tr>", &timeinfo);
 	strcat(resp_str, line);
 
 	snprintf(line, 100, "<td>Water<td>%s</tr>\n", state.water_on ? "On" : "Off");
@@ -734,6 +952,7 @@ esp_err_t handler_index(httpd_req_t *req)
 			snprintf(line, 100, "<tr><td><td>%s command ok</tr>\n", actions[action_idx].name);
 		else
 			snprintf(line, 100, "<tr><td><td>%s command failed: %u</tr>\n", actions[action_idx].name, err);
+		strcat(resp_str, line);
 	}
 	strcat(resp_str, "</table>\n");
 
@@ -751,7 +970,7 @@ esp_err_t handler_index(httpd_req_t *req)
 			num_events++;
 			if (event->skip)
 			{
-				snprintf(line, 100, "Every %u seconds at %02u:%02u for %u seconds<br>\n",
+				snprintf(line, 100, "Every %u seconds at %02u:%02u for %u seconds",
 					event->skip+1, event->hour, event->minute, event->duration);
 				strcat(resp_str, line);
 			}
@@ -759,7 +978,7 @@ esp_err_t handler_index(httpd_req_t *req)
 			{
 				if (event->days == 0)
 				{
-					snprintf(line, 100, "Every day at %02u:%02u for %u seconds<br>\n",
+					snprintf(line, 100, "Every day at %02u:%02u for %u seconds",
 						event->hour, event->minute, event->duration);
 					strcat(resp_str, line);
 				}
@@ -777,11 +996,15 @@ esp_err_t handler_index(httpd_req_t *req)
 							strcat(resp_str, day_str[day]);
 						}
 					}
-					snprintf(line, 100, " at %02u:%02u for %u seconds <a href=/?action=del_event&index=%u>[-]</a><br>\n",
-						event->hour, event->minute, event->duration, evt);
+					snprintf(line, 100, " at %02u:%02u for %u seconds",
+						event->hour, event->minute, event->duration);
 					strcat(resp_str, line);
 				}
 			}
+
+			// add link for removing the event
+			snprintf(line, 100, " <a href=/?action=del_event&index=%u>[-]</a><br>\n", evt);
+			strcat(resp_str, line);
 		}
 	}
 
@@ -791,11 +1014,13 @@ esp_err_t handler_index(httpd_req_t *req)
 		strcat(resp_str, "<a href=/add_event>[+] Add event</a><br>\n");
 
 	strcat(resp_str, "<h2>Networking</h2>\n<table>");
-	snprintf(line, 100, "<tr><td>Access Point<td>%s</tr>\n", wifi_config.sta.ssid);
+	snprintf(line, 100, "<tr><td>Access Point<td>%s <a href=/wifi>[*]</a></tr>\n", wifi_config.sta.ssid);
 	strcat(resp_str, line);
-	snprintf(line, 100, "<tr><td>Time Server<td>%s</tr>\n", ntp_server);
+	snprintf(line, 128, "<tr><td>NTP Server<td>%s <a href=/ntp>[*]</a></tr>\n", ntp_server);
 	strcat(resp_str, line);
-	snprintf(line, 100, "<tr><td>Hostname<td>%s</tr>\n", hostname);
+	snprintf(line, 128, "<tr><td>Upgrade URL<td>%s <a href=/upgrade>[*]</a></tr>\n", upgrade_url);
+	strcat(resp_str, line);
+	snprintf(line, 100, "<tr><td>Hostname<td>%s <a href=/hostname>[*]</a></tr>\n", hostname);
 	strcat(resp_str, line);
 	snprintf(line, 100, "<tr><td>MAC<td>%02x:%02x:%02x:%02x:%02x:%02x</tr>\n",
 		mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -813,8 +1038,8 @@ esp_err_t handler_index(httpd_req_t *req)
 		snprintf(line, 100, "<a href=\"/?action=water_on\">Water On</a><br>\n");
 	strcat(resp_str, line);
 	strcat(resp_str, "<a href=\"/?action=update_fw\">Update Firmware</a><br>\n");
+	strcat(resp_str, "<a href=\"/?action=help\">Help</a><br>\n");
 	strcat(resp_str, "</body></html>");
-	ESP_LOGI(TAG, "Length %u", strlen(resp_str));
 
 	httpd_resp_send(req, resp_str, strlen(resp_str));
 
@@ -823,13 +1048,14 @@ esp_err_t handler_index(httpd_req_t *req)
 
 esp_err_t form_hostname(httpd_req_t *req)
 {
-	char line[100];
+	char line[110];
 	char resp_str[MAX_RESPONSE];
 	resp_str[0] = 0;
 
 	strcat(resp_str, "<html><title>Watering System</title>\n<body>\n");
-	strcat(resp_str, "<h1>Set Hostname</h1>\n<form action=\"/config/set_hostname\" method=\"POST\">\n");
-	snprintf(line, 100, "<input type=\"text\" id=\"host\" value=\"%s\"><br>", hostname);
+	strcat(resp_str, "<h1>Set Hostname</h1>\n<form action=\"/\" method=\"PUT\">\n");
+	strcat(resp_str, "<br><input type=\"hidden\" name=\"action\" value=\"set_hostname\">\n");
+	snprintf(line, 110, "New host name: <input type=\"text\" name=\"host\" value=\"%s\" maxwidth=%u><br>", hostname, MAX_HOSTNAME);
 	strcat(resp_str, line);
 	strcat(resp_str, "<br><input type=\"submit\" value=\"Update\">\n");
 	strcat(resp_str, "</form></body></html>");
@@ -854,277 +1080,100 @@ esp_err_t form_add_event(httpd_req_t *req)
 	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d4\">Thursday</tr>\n");
 	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d5\">Friday</tr>\n");
 	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d6\">Saturday</tr>\n");
-	strcat(resp_str, "<tr><td>For<td><input type=\"number\" name=\"duration\" maxlength=4 max=3600> seconds</tr></table>\n");
+	strcat(resp_str, "<tr><td>For<td><input type=\"number\" name=\"duration\" maxlength=4 min=1 max=3600> seconds</tr></table>\n");
 	strcat(resp_str, "<input type=\"submit\" value=\"Add\">\n");
 	strcat(resp_str, "</form></body></html>");
 
 	return httpd_resp_send(req, resp_str, strlen(resp_str));
 }
 
+esp_err_t form_set_time(httpd_req_t *req)
+{
+	char resp_str[MAX_RESPONSE];
+	resp_str[0] = 0;
+
+	strcat(resp_str, "<html><title>Watering System</title>\n<body>\n");
+	strcat(resp_str, "<h1>Set Date and Time</h1>\n<form action=\"/\" method=\"PUT\">\n");
+	strcat(resp_str, "<br><input type=\"hidden\" name=\"action\" value=\"set_time\">\n");
+	strcat(resp_str, "<input type=\"datetime-local\" name=\"time\"><br>\n");
+	strcat(resp_str, "<input type=\"submit\" value=\"Set\">\n");
+	strcat(resp_str, "</form></body></html>");
+
+	return httpd_resp_send(req, resp_str, strlen(resp_str));
+}
+
 /*
-	Set time manually
+	HTML form to set the NTP server name
 */
-esp_err_t handler_set_time(httpd_req_t *req)
+esp_err_t form_set_ntp(httpd_req_t *req)
 {
-	char resp_str[14];
-	char query[256];
-	char value[64];
-	struct tm timeinfo = { 0 };
-	struct timeval newtime;
-	char strftime_buf[64];
+	char line[128];
+	char resp_str[MAX_RESPONSE];
+	resp_str[0] = 0;
 
-	// parse the parameters to get the new time
-	if (httpd_req_recv(req, query, 256) > 0)
-	{
-		query[req->content_len] = 0;
-		if (httpd_query_key_value(query, "sec", value, 3) == ESP_OK)
-			timeinfo.tm_sec = atoi(value);
-		else
-			return httpd_resp_send_500(req);
-		if (httpd_query_key_value(query, "min", value, 3) == ESP_OK)
-			timeinfo.tm_min = atoi(value);
-		else
-			return httpd_resp_send_500(req);
-		if (httpd_query_key_value(query, "hour", value, 3) == ESP_OK)
-			timeinfo.tm_hour = atoi(value);
-		else
-			return httpd_resp_send_500(req);
-		if (httpd_query_key_value(query, "day", value, 3) == ESP_OK)
-			timeinfo.tm_mday = atoi(value);
-		else
-			return httpd_resp_send_500(req);
+	strcat(resp_str, "<html><title>Watering System</title>\n<body>\n");
+	strcat(resp_str, "<h1>Set NTP Server</h1>\n<form action=\"/\" method=\"PUT\">\n");
+	strcat(resp_str, "<br><input type=\"hidden\" name=\"action\" value=\"set_ntp\">\n");
+	snprintf(line, 128, "<input type=\"text\" name=\"server\" value=\"%s\"><br>\n", ntp_server);
+	strcat(resp_str, line);
+	strcat(resp_str, "<input type=\"submit\" value=\"Set\">\n");
+	strcat(resp_str, "</form></body></html>");
 
-		// the month is 0-based so subtract 1
-		if (httpd_query_key_value(query, "mon", value, 3) == ESP_OK)
-			timeinfo.tm_mon = atoi(value) - 1;
-		else
-			return httpd_resp_send_500(req);
-
-		// the year counts from 1900
-		if (httpd_query_key_value(query, "year", value, 5) == ESP_OK)
-			timeinfo.tm_year = atoi(value) - 1900;
-		else
-			return httpd_resp_send_500(req);
-	}
-	else
-		ESP_LOGI(TAG, "can't find query");
-
-	newtime.tv_usec = 0;
-	newtime.tv_sec = mktime(&timeinfo);
-	settimeofday(&newtime, NULL);
-	strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-	ESP_LOGI(TAG, "Time set to %s", strftime_buf);
-
-	sprintf(resp_str, "OK\n");
-	httpd_resp_send(req, resp_str, strlen(resp_str));
-
-	return ESP_OK;
+	return httpd_resp_send(req, resp_str, strlen(resp_str));
 }
 
-esp_err_t handler_del_event(httpd_req_t *req)
+/*
+	HTML form to set the wifi SSID and password
+*/
+esp_err_t form_set_wifi(httpd_req_t *req)
 {
-	char resp_str[14];
-	char query[256];
-	char value[64];
-	uint8_t evt=MAX_EVENTS;	// event index
-
-	// parse the parameters to get the new time - all fields are mandatory
-	if (httpd_req_recv(req, query, 256) > 0)
-	{
-		query[req->content_len] = 0;
-		if (httpd_query_key_value(query, "event", value, 3) == ESP_OK)
-			evt = atoi(value);
-	}
-
-	if (del_water_event(evt) == 0)
-	{
-		sprintf(resp_str, "OK\n");
-		return httpd_resp_send(req, resp_str, strlen(resp_str));
-	}
-
-	return httpd_resp_send_500(req);
-}
-
-esp_err_t handler_add_event(httpd_req_t *req)
-{
-	char resp_str[14];
-	char query[256];
-	char value[64];
-	water_event event;
-
-	memset(&event, 0, sizeof(water_event));
-
-	// parse the parameters to get the new time - all fields are mandatory
-	if (httpd_req_recv(req, query, 256) > 0)
-	{
-		query[req->content_len] = 0;
-		if (httpd_query_key_value(query, "hour", value, 3) == ESP_OK)
-			event.hour = atoi(value);
-
-		if (httpd_query_key_value(query, "minute", value, 3) == ESP_OK)
-			event.minute = atoi(value);
-
-		if (httpd_query_key_value(query, "skip", value, 4) == ESP_OK)
-			event.skip = atoi(value);
-
-		if (httpd_query_key_value(query, "days", value, 4) == ESP_OK)
-			event.days = atoi(value);
-
-		if (httpd_query_key_value(query, "duration", value, 6) == ESP_OK)
-			event.duration = atoi(value);
-	}
-
-	// add the event
-	if (add_water_event(&event) == 0)
-	{
-		sprintf(resp_str, "OK\n");
-		return httpd_resp_send(req, resp_str, strlen(resp_str));
-	}
-
-	return httpd_resp_send_500(req);
-}
-
-esp_err_t handler_set_wifi(httpd_req_t *req)
-{
-	char resp_str[14];
-	char query[256];
-	char value[64];
-	bool new_ssid = false;
+	char line[200];
+	char resp_str[MAX_RESPONSE];
 	wifi_config_t wifi_config;
 
+	resp_str[0] = 0;
 	esp_wifi_get_config(ESP_IF_WIFI_STA, &wifi_config);
 
-	// parse the parameters to find the new ssid name
-	if (httpd_req_recv(req, query, 256) > 0)
-	{
-		query[req->content_len] = 0;
-		if (httpd_query_key_value(query, "ssid", value, 32) == ESP_OK)
-		{
-			//ESP_LOGI(TAG, "ssid: %s", urldecode(value));
-			strncpy((char*)wifi_config.sta.ssid, value, 32);
-			new_ssid = true;
-		}
-		if (httpd_query_key_value(query, "pw", value, 64) == ESP_OK)
-		{
-			strncpy((char*)wifi_config.sta.password, value, 64);
-			//ESP_LOGI(TAG, "pw: %s", urldecode(value));
-		}
-	}
-	else
-		ESP_LOGI(TAG, "can't find query");
+	strcat(resp_str, "<html><title>Watering System</title>\n<body>\n");
+	strcat(resp_str, "<h1>Set Wifi Access Point</h1>\n<form action=\"/\" method=\"PUT\">\n");
+	strcat(resp_str, "<input type=\"hidden\" name=\"action\" value=\"set_wifi\">\n<table>");
+	snprintf(line, 128, "<tr><td>SSID<td><input type=\"text\" name=\"ssid\" value=\"%s\"></tr>\n", wifi_config.sta.ssid);
+	strcat(resp_str, line);
+	snprintf(line, 200, "<tr><td>Password<td><input type=\"password\" name=\"password\" value=\"%s\"></tr>\n", wifi_config.sta.password);
+	strcat(resp_str, line);
+	strcat(resp_str, "</table>\n<input type=\"submit\" value=\"Set\">\n");
+	strcat(resp_str, "</form></body></html>");
 
-
-	sprintf(resp_str, "OK\n");
-	httpd_resp_send(req, resp_str, strlen(resp_str));
-
-	if (new_ssid)
-	{
-		sleep(3);
-		ESP_LOGI(TAG, "Connecting to AP: %s with password %s", wifi_config.sta.ssid, wifi_config.sta.password);
-		esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
-		esp_wifi_disconnect();
-		//esp_timer_start_once(reboot_timer, 100000);
-	}
-	return ESP_OK;
+	return httpd_resp_send(req, resp_str, strlen(resp_str));
 }
 
-esp_err_t handler_set_ntp(httpd_req_t *req)
+/*
+	HTML form to change the upgrade URL
+*/
+esp_err_t form_set_upgrade(httpd_req_t *req)
 {
-	char resp_str[14];
-	char query[256];
-	char value[64];
-	nvs_handle nvs;
+	char line[136];
+	char resp_str[MAX_RESPONSE];
+	resp_str[0] = 0;
 
-	if (httpd_req_recv(req, query, 256) > 0)
-	{
-		query[req->content_len] = 0;
-		if ((httpd_query_key_value(query, "ntp", value, 64) == ESP_OK)
-		&& (nvs_open(nvs_namespace, NVS_READWRITE, &nvs) == ESP_OK))
-		{
-			size_t length;
-			char old_value[64];
+	strcat(resp_str, "<html><title>Watering System</title>\n<body>\n");
+	strcat(resp_str, "<h1>Set Upgrade URL</h1>\n<form action=\"/\" method=\"PUT\">\n");
+	strcat(resp_str, "<br><input type=\"hidden\" name=\"action\" value=\"set_upgrade\">\n");
+	snprintf(line, 136, "URL <input type=\"text\" name=\"url\" value=\"%s\" size=64 maxlength=%u><br>\n", upgrade_url, MAX_UPGRADE_URL-1);
+	strcat(resp_str, line);
+	strcat(resp_str, "<input type=\"submit\" value=\"Set\">\n");
+	strcat(resp_str, "</form></body></html>");
 
-			// check if the value has changed
-			length = 64;
-			if (nvs_get_str(nvs, "ntp", old_value, &length) != ESP_OK || strcmp(old_value, value) != 0)
-			{
-				nvs_set_str(nvs, "ntp", value);
-				strcpy(ntp_server, value);
-				ESP_LOGI(TAG, "NTP server: %s\n", value);
-			}
-			nvs_close(nvs);
-		}
-	}
-
-	// respond to client
-	sprintf(resp_str, "OK\n");
-	httpd_resp_send(req, resp_str, strlen(resp_str));
-	return ESP_OK;
+	return httpd_resp_send(req, resp_str, strlen(resp_str));
 }
 
-esp_err_t handler_set_hostname(httpd_req_t *req)
+/*
+	Send the icon that the browser displays for this page
+*/
+esp_err_t favicon(httpd_req_t *req)
 {
-	char resp_str[14];
-	char query[256];
-	char value[64];
-	nvs_handle nvs;
-
-	if (httpd_req_recv(req, query, 256) > 0)
-	{
-		query[req->content_len] = 0;
-		ESP_LOGI(TAG, "Query: %s", query);
-		if ((httpd_query_key_value(query, "host", value, 64) == ESP_OK)
-		&& (nvs_open(nvs_namespace, NVS_READWRITE, &nvs) == ESP_OK))
-		{
-			size_t length;
-			char old_value[32];
-
-			// check if the value has changed
-			length = 32;
-			if (nvs_get_str(nvs, "host", old_value, &length) != ESP_OK || strcmp(old_value, value) != 0)
-			{
-				nvs_set_str(nvs, "host", value);
-				strcpy(hostname, value);
-				ESP_LOGI(TAG, "New hostname: %s", value);
-			}
-			nvs_close(nvs);
-		}
-	}
-
-	// respond to client
-	sprintf(resp_str, "OK\n");
-	httpd_resp_send(req, resp_str, strlen(resp_str));
-	return ESP_OK;
-}
-
-// Set time from NTP server
-static void obtain_time(void)
-{
-	time_t now = 0;
-	struct tm timeinfo = { 0 };
-	int retry = 0;
-	const int retry_count = 10;
-	char strftime_buf[64];
-
-	ESP_LOGI(TAG, "Syncing NTP time from %s", ntp_server);
-	sntp_setoperatingmode(SNTP_OPMODE_POLL);
-	sntp_setservername(0, ntp_server);
-	sntp_init();
-
-	while (timeinfo.tm_year < (2016 - 1900) && ++retry < retry_count)
-	{
-		ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
-		sleep(1);
-		time(&now);
-		localtime_r(&now, &timeinfo);
-	}
-
-	if (retry < retry_count)
-	{
-		state.internet = true;
-		strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-		ESP_LOGI(TAG, "Time is: %s", strftime_buf);
-	}
+	int length = favicon_png_end - favicon_png_start;
+	return httpd_resp_send(req, (char*)favicon_png_start, length);
 }
 
 httpd_handle_t start_webserver(void)
@@ -1133,7 +1182,7 @@ httpd_handle_t start_webserver(void)
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
 	// Start the httpd server
-	ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
+	ESP_LOGI(TAG, "Starting web server on port: '%d'", config.server_port);
 	config.max_uri_handlers = MAX_URI_HANDLERS;
 	if (httpd_start(&server, &config) == ESP_OK)
 	{
@@ -1152,16 +1201,35 @@ httpd_handle_t start_webserver(void)
 
 static httpd_handle_t server = NULL;
 
-static void disconnect_handler(void* arg, esp_event_base_t event_base, 
+static void on_wifi_disconnect(void* arg, esp_event_base_t event_base, 
                                int32_t event_id, void* event_data)
 {
-	httpd_handle_t* server = (httpd_handle_t*) arg;
+	httpd_handle_t* server = (httpd_handle_t*) event_data;
+	system_event_sta_disconnected_t *event = (system_event_sta_disconnected_t *)event_data;
+
+	ESP_LOGI(TAG, "on_wifi_disconnect reason: %u", event->reason);
+
 	if (*server)
 	{
 		ESP_LOGI(TAG, "Stopping webserver");
 		httpd_stop(server);
 		*server = NULL;
 	}
+
+	switch (event->reason)
+	{
+	case WIFI_REASON_BASIC_RATE_NOT_SUPPORT:
+		/* Switch to 802.11 bgn mode */
+		esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+		break;
+	}
+
+	ESP_LOGI(TAG, "Connecting");
+	blink_start(BLINK_FAST);
+	esp_wifi_connect();
+
+	// go to WPS if connect fails
+	esp_timer_start_once(connect_timer, WIFI_CONNECT_TIMEOUT);
 }
 
 static void on_ip_connect(void* arg, esp_event_base_t event_base, 
@@ -1177,7 +1245,6 @@ static void on_ip_connect(void* arg, esp_event_base_t event_base,
 	led_off();
 
     if (*server == NULL) {
-        ESP_LOGI(TAG, "Starting webserver");
         *server = start_webserver();
     }
 
@@ -1188,20 +1255,41 @@ static void on_ip_connect(void* arg, esp_event_base_t event_base,
 		mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
 	}
 
+	// start NTP client
 	obtain_time();
+
+	uint8_t retries = 10;
+	while (--retries)
+	{
+		if (sntp_getreachability(0) != 0)
+		{
+			ESP_LOGI(TAG, "Internet is up");
+			state.internet = true;
+			break;
+		}
+		sleep(1);
+	}
+}
+
+static void on_ip_disconnect(void* arg, esp_event_base_t event_base, 
+                            int32_t event_id, void* event_data)
+{
+	//ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+	//httpd_handle_t* server = (httpd_handle_t*) arg;
+
+	ESP_LOGI(TAG, "IP disconnect");
 }
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
-	//nvs_handle nvs;
 	wifi_config_t wifi_config;
 	esp_wifi_get_config(ESP_IF_WIFI_STA, &wifi_config);
 
 	switch (event_id)
 	{
 	case WIFI_EVENT_STA_START:
-		ESP_LOGI(TAG, "Reconnecting to AP: %s with password %s", wifi_config.sta.ssid, wifi_config.sta.password);
+		ESP_LOGI(TAG, "Connecting to AP: %s", wifi_config.sta.ssid);
 		blink_start(BLINK_FAST);
 		if (esp_wifi_connect() == ESP_OK)
 		{
@@ -1218,23 +1306,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
 	case WIFI_EVENT_STA_CONNECTED:
 		esp_timer_stop(connect_timer);
-		ESP_LOGI(TAG, "WIFI connected to %s\n", wifi_config.sta.ssid);
+		ESP_LOGI(TAG, "WIFI connected to %s", wifi_config.sta.ssid);
 		break;
 
 	case WIFI_EVENT_STA_DISCONNECTED:
-		{
-			system_event_sta_disconnected_t *event = (system_event_sta_disconnected_t *)event_data;
-
-			ESP_LOGI(TAG, "WIFI_EVENT_STA_DISCONNECTED");
-			if (event->reason == WIFI_REASON_BASIC_RATE_NOT_SUPPORT)
-			{
-				/* Switch to 802.11 bgn mode */
-				esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-			}
-
-			blink_start(BLINK_FAST);
-			ESP_ERROR_CHECK(esp_wifi_connect());
-	   }
+		//ESP_LOGE(TAG, "Default disconnect handler");
 		break;
 
 	case WIFI_EVENT_STA_WPS_ER_SUCCESS:
@@ -1242,7 +1318,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 		blink_start(BLINK_FAST);
 		/* esp_wifi_wps_start() only gets ssid & password, so call esp_wifi_connect() here. */
 		ESP_ERROR_CHECK(esp_wifi_wps_disable());
-		ESP_ERROR_CHECK(esp_wifi_connect());
+		blink_start(BLINK_FAST);
+		if (esp_wifi_connect() == ESP_OK)
+			esp_timer_start_once(connect_timer, WIFI_CONNECT_TIMEOUT);
 		break;
 
 	case WIFI_EVENT_STA_WPS_ER_FAILED:
@@ -1276,6 +1354,7 @@ void app_main()
 {
 	uint8_t mac[7];
 	nvs_handle nvs;
+	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 
 	const esp_timer_create_args_t blink_timer_args = {
 		.callback = blink_callback,
@@ -1312,36 +1391,38 @@ void app_main()
 		.name = ""
 	};
 
+	// we are alive
+	ESP_LOGI(TAG, "Watering System v%u.%u", VER_MAJOR, VER_MINOR);
+
 	// make sure all events are off until they are programmed
 	for (uint8_t evt = 0; evt < MAX_EVENTS; evt++)
 		state.schedule[evt].enabled = false;
 
 	// set up wifi configuration
-	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-	tcpip_adapter_init();
 
+   ESP_ERROR_CHECK(nvs_flash_init());
+   ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+	// gpios
 	gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
 	gpio_set_direction(WATER_PIN, GPIO_MODE_OUTPUT);
 	gpio_set_level(WATER_PIN, 0);
 
-	// set up software
+	// set up timers
 	esp_timer_create(&blink_timer_args, &blink_timer);
 	esp_timer_create(&connect_timer_args, &connect_timer);
 	esp_timer_create(&schedule_timer_args, &schedule_timer);
 	esp_timer_create(&water_timer_args, &water_timer);
 	esp_timer_create(&reboot_timer_args, &reboot_timer);
 
-   ESP_ERROR_CHECK(nvs_flash_init());
-   ESP_ERROR_CHECK(esp_netif_init());
-   ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-	ESP_LOGI(TAG, "Watering System v%u.%u", VER_MAJOR, VER_MINOR);
-
+	// set up networking
 	if (esp_base_mac_addr_get(mac) == ESP_ERR_INVALID_MAC)
 	{
 		esp_efuse_mac_get_default(mac);
 		esp_base_mac_addr_set(mac);
 	}
+
+	tcpip_adapter_init();
 
 	// enable the wifi
 	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -1366,7 +1447,20 @@ void app_main()
 		length = 32;
 		if (nvs_get_str(nvs, "host", value, &length) == ESP_OK)
 		{
-			strncpy(hostname, value, 32);
+			set_hostname(value);
+		}
+
+		// host name
+		length = 8;
+		if (nvs_get_str(nvs, "timezone", value, &length) == ESP_OK)
+		{
+			set_timezone(value);
+		}
+
+		length = 64;
+		if (nvs_get_str(nvs, "upgrade", value, &length) == ESP_OK)
+		{
+			strncpy(upgrade_url, value, 64);
 		}
 
 		// scheduled events
@@ -1382,22 +1476,18 @@ void app_main()
 	}
 
 	ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_ip_connect, &server));
+	ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &on_ip_disconnect, &server));
 	ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, &server));
-	ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
+	ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &on_wifi_disconnect, &server));
 	ESP_ERROR_CHECK(esp_wifi_start());
 
 	ESP_ERROR_CHECK(mdns_init());
 
+	// Set timezone to Pacific Standard Time
+	set_timezone("PDT+7");
 	ESP_LOGI(TAG, "Using NTP server %s", ntp_server);
 	ESP_LOGI(TAG, "Using hostname %s", hostname);
-
-	// the host name must be set for mDNS and LWIP
-	ESP_LOGI(TAG, "setting hostname to %s", hostname);
-	mdns_hostname_set(hostname);
-
-	// Set timezone to Pacific Standard Time
-	setenv("TZ", "PDT+7", 1);
-	tzset();
+	ESP_LOGI(TAG, "Using timezone %s", timezone);
 
 	// start the scheduler
 	esp_timer_start_periodic(schedule_timer, 1000000 * 60); // wake up once per minute

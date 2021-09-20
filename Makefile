@@ -5,7 +5,7 @@
 
 PROJECT_NAME := water
 
-EXTRA_COMPONENT_DIRS = $(IDF_PATH)/examples/common_components/protocol_examples_common
+EXCLUDE_COMPONENTS := console coap esp_gdbstub freemodbus jsmn json libsodium esp-mqtt
 
 include $(IDF_PATH)/make/project.mk
 
