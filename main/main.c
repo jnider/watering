@@ -22,8 +22,8 @@
 #include <esp_http_server.h>
 
 #define VER_MAJOR 1
-#define VER_MINOR 10
-#define MAX_RESPONSE 1024
+#define VER_MINOR 12
+#define MAX_RESPONSE 1023
 #define WIFI_CONNECT_TIMEOUT (1000000 * 5)
 #define MAX_EVENTS 5					// number of scheduled watering events
 #define MAX_URI_HANDLERS 10		// registered URIs
@@ -35,6 +35,8 @@
 #define MAX_SSID 32
 #define MAX_PW	64
 #define MAX_UPGRADE_URL 64
+#define MAX_LINE_LENGTH 100
+#define MAX_DURATION 86400 		// maximum event duration in seconds
 
 #ifndef PIN2STR
 #define PIN2STR(a) (a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5], (a)[6], (a)[7]
@@ -79,7 +81,7 @@ typedef struct water_event
 	uint8_t minute;		// starting minute
 	uint8_t skip;			// how many seconds to skip before recurrance (0 = read 'days')
 	uint8_t days;			// bitmap of specific days to execute on
-	uint32_t duration;	// how many seconds to leave the tap open
+	uint32_t duration;	// how many seconds before turning off
 } water_event;
 
 typedef struct program_state
@@ -465,8 +467,17 @@ esp_err_t action_handler_add_event(const char *query)
 	if (event.days == 0x7F)
 		event.days = 0;
 
-	if (httpd_query_key_value(query, "duration", value, 5) == ESP_OK)
-		event.duration = atoi(value);
+	if (httpd_query_key_value(query, "duration", value, 8) == ESP_OK)
+	{
+		uint32_t duration = atoi(value);
+		if (duration <= MAX_DURATION)
+			event.duration = duration;
+		else
+		{
+			ESP_LOGI(TAG, "Duration %u is longer than %u", duration, MAX_DURATION);
+			return ESP_FAIL;
+		}
+	}
 
 	// add the event
 	if (add_water_event(&event) == 0)
@@ -849,12 +860,12 @@ void no_connect_callback(void *arg)
 
 esp_err_t handler_help(httpd_req_t *req)
 {
-	char line[100];
+	char line[MAX_LINE_LENGTH+1];
 	char resp_str[MAX_RESPONSE];
 	resp_str[0] = 0;
 
 	strcat(resp_str, "<html><title>Watering System - Help</title>\n<body>\n");
-	snprintf(line, 100, "<h1>Joel's Watering System v%u.%u</h1>\n", VER_MAJOR, VER_MINOR);
+	snprintf(line, MAX_LINE_LENGTH, "<h1>Joel's Watering System v%u.%u</h1>\n", VER_MAJOR, VER_MINOR);
 	strcat(resp_str, line);
 	strcat(resp_str, "<h2>Command Help</h2><table><tr><td>Action<td>Parameters<td>Description<td>Example</tr>\n");
 	strcat(resp_str, "<tr><td>water_on<td><td>Turn water on now<td>http://192.168.1.1/?action=water_on</tr>\n");
@@ -890,7 +901,7 @@ esp_err_t handler_index(httpd_req_t *req)
 	bool command = false;
 	uint8_t action_idx;
 
-	// find out what the users wants to do
+	// find out what the user wants to do
 	if (httpd_req_get_url_query_str(req, query, 256) == ESP_OK)
 	{
 		ESP_LOGI(TAG, "Query: %s", query);
@@ -926,18 +937,18 @@ esp_err_t handler_index(httpd_req_t *req)
 
 	resp_str[0] = 0;
 	strcat(resp_str, "<html><head><meta http-equiv=\"refresh\" content=\"" PAGE_AUTO_REFRESH ";url=/\"><title>Watering System</title></head>\n<body>\n");
-	snprintf(line, 100, "<h1>Joel's Watering System v%u.%u</h1>\n", VER_MAJOR, VER_MINOR);
+	snprintf(line, MAX_LINE_LENGTH, "<h1>Joel's Watering System v%u.%u</h1>\n", VER_MAJOR, VER_MINOR);
 	strcat(resp_str, line);
 	strcat(resp_str, "<h2>Status</h2><table><tr><td>Time<td>\n");
 	strftime(line, sizeof(line), "%c <a href=/time>[*]</a></tr>", &timeinfo);
 	strcat(resp_str, line);
 
-	snprintf(line, 100, "<td>Water<td>%s</tr>\n", state.water_on ? "On" : "Off");
+	snprintf(line, MAX_LINE_LENGTH, "<td>Water<td>%s</tr>\n", state.water_on ? "On" : "Off");
 	strcat(resp_str, line);
 
 	if (state.last_watering)
 	{
-		snprintf(line, 100, "<td>Last watering at<td>%s for %i minute%s %i second%s</tr>\n",
+		snprintf(line, MAX_LINE_LENGTH, "<td>Last watering at<td>%s for %i minute%s %i second%s</tr>\n",
 			ctime(&state.last_watering), state.last_duration / 60,
 			(state.last_duration / 60 == 1) ? "" : "s",
 			state.last_duration % 60,
@@ -1065,10 +1076,10 @@ esp_err_t form_hostname(httpd_req_t *req)
 
 esp_err_t form_add_event(httpd_req_t *req)
 {
-	char resp_str[MAX_RESPONSE];
-	resp_str[0] = 0;
+	char resp_str[MAX_RESPONSE+1];
+	char line[MAX_LINE_LENGTH+1];
 
-	strcat(resp_str, "<html><title>Watering System</title>\n<body>\n");
+	strcpy(resp_str, "<html><title>Watering System</title>\n<body>\n");
 	strcat(resp_str, "<h1>Add Event</h1>\n<form action=\"/\" method=\"PUT\">\n");
 	strcat(resp_str, "<br><input type=\"hidden\" name=\"action\" value=\"add_event\">\n");
 	strcat(resp_str, "<table><tr><td>Turn on at<td><input type=\"time\" name=\"time\"></tr>\n");
@@ -1080,7 +1091,9 @@ esp_err_t form_add_event(httpd_req_t *req)
 	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d4\">Thursday</tr>\n");
 	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d5\">Friday</tr>\n");
 	strcat(resp_str, "<tr><td><td><input type=\"checkbox\" name=\"d6\">Saturday</tr>\n");
-	strcat(resp_str, "<tr><td>For<td><input type=\"number\" name=\"duration\" maxlength=4 min=1 max=3600> seconds</tr></table>\n");
+	sprintf(line, "<tr><td>For<td><input type=\"number\" name=\"duration\" maxlength=5 min=1 max=%u> seconds</tr>", MAX_DURATION);
+	strcat(resp_str, line);
+	strncat(resp_str, "</table>\n", MAX_RESPONSE);
 	strcat(resp_str, "<input type=\"submit\" value=\"Add\">\n");
 	strcat(resp_str, "</form></body></html>");
 
@@ -1481,7 +1494,7 @@ void app_main()
 	ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &on_wifi_disconnect, &server));
 	ESP_ERROR_CHECK(esp_wifi_start());
 
-	ESP_ERROR_CHECK(mdns_init());
+	//ESP_ERROR_CHECK(mdns_init());
 
 	// Set timezone to Pacific Standard Time
 	set_timezone("PDT+7");
